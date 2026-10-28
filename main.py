@@ -48,7 +48,8 @@ def display_results(results: dict):
     print(f" Strategy Mode        : {s.get('mode_label')}")
     print(f" Initial Capital      : ${s.get('initial_balance'):,.2f}")
     print(f" Final Capital        : ${s.get('final_balance'):,.2f}")
-    print(f" Net Profit           : ${s.get('net_profit'):+,.2f} ({s.get('total_return_pct'):+.2f}%)")
+    print(f" Gross Profit (Paper) : ${s.get('gross_profit', 0.0):+,.2f}")
+    print(f" Net Profit (Fees)    : ${s.get('net_profit'):+,.2f} ({s.get('total_return_pct'):+.2f}%)")
     print(f" Peak Capital         : ${s.get('peak_balance'):,.2f}")
     print(f" Max Drawdown         : -${s.get('max_drawdown'):,.2f} (-{s.get('max_drawdown_pct'):.2f}%)")
     print("-" * 80)
@@ -64,8 +65,8 @@ def display_results(results: dict):
     print(f" Annualized Sharpe    : {s.get('sharpe_ratio')}")
     print("-" * 80)
     print(" DIRECTIONAL PERFORMANCE:")
-    print(f"   UP   Trades : {bs.get('UP', {}).get('trades'):5d} | Win Rate: {bs.get('UP', {}).get('win_rate'):5.1f}% | PnL: ${bs.get('UP', {}).get('pnl'):+10.2f}")
-    print(f"   DOWN Trades : {bs.get('DOWN', {}).get('trades'):5d} | Win Rate: {bs.get('DOWN', {}).get('win_rate'):5.1f}% | PnL: ${bs.get('DOWN', {}).get('pnl'):+10.2f}")
+    print(f"   UP   Trades : {bs.get('UP', {}).get('trades'):5d} | Win Rate: {bs.get('UP', {}).get('win_rate'):5.1f}% | Gross: ${bs.get('UP', {}).get('gross_pnl', 0):+10.2f} | Net: ${bs.get('UP', {}).get('pnl'):+10.2f}")
+    print(f"   DOWN Trades : {bs.get('DOWN', {}).get('trades'):5d} | Win Rate: {bs.get('DOWN', {}).get('win_rate'):5.1f}% | Gross: ${bs.get('DOWN', {}).get('gross_pnl', 0):+10.2f} | Net: ${bs.get('DOWN', {}).get('pnl'):+10.2f}")
     print("=" * 80)
 
 

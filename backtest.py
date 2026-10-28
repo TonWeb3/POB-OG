@@ -115,6 +115,16 @@ class FastMarketDataset:
             self.ha_5m_green_streak = np.zeros(self.n_rows, dtype=int)
             self.ha_5m_red_streak = np.zeros(self.n_rows, dtype=int)
 
+        # Real UP and DOWN orderbook prices
+        self.up_ask = df["up_ask"].values
+        self.up_bid = df["up_bid"].values
+        if "down_ask" in df.columns and "down_bid" in df.columns:
+            self.down_ask = df["down_ask"].values
+            self.down_bid = df["down_bid"].values
+        else:
+            self.down_ask = 1.0 - self.up_bid
+            self.down_bid = 1.0 - self.up_ask
+
         # Orderbook depth / liquidity for min_book_liquidity check
         if "up_ask_size" in df.columns and "up_bid_size" in df.columns:
             self.up_ask_size = df["up_ask_size"].values
@@ -122,6 +132,13 @@ class FastMarketDataset:
         else:
             self.up_ask_size = np.full(self.n_rows, np.nan)
             self.up_bid_size = np.full(self.n_rows, np.nan)
+
+        if "down_ask_size" in df.columns and "down_bid_size" in df.columns:
+            self.down_ask_size = df["down_ask_size"].values
+            self.down_bid_size = df["down_bid_size"].values
+        else:
+            self.down_ask_size = self.up_bid_size
+            self.down_bid_size = self.up_ask_size
 
         # Market boundaries
         boundaries = np.where(self.slugs[:-1] != self.slugs[1:])[0] + 1
@@ -131,6 +148,7 @@ class FastMarketDataset:
         self.mkt_strikes = np.zeros(self.n_mkts, dtype=float)
         self.mkt_up_wons = np.zeros(self.n_mkts, dtype=bool)
         self.mkt_slugs = []
+        self.mkt_ts_starts = np.zeros(self.n_mkts, dtype="int64")
 
         up_wons_raw = df["up_won"].values
         strikes_raw = df["strike"].values
@@ -140,13 +158,12 @@ class FastMarketDataset:
             self.mkt_strikes[i] = strikes_raw[idx]
             self.mkt_up_wons[i] = bool(up_wons_raw[idx] > 0.5)
             self.mkt_slugs.append(self.slugs[idx])
+            self.mkt_ts_starts[i] = int(self.slugs[idx].rsplit("-", 1)[1])
 
         # Fast tick arrays
         self.t_s = df["t_s"].values
         self.tau_s = df["tau_s"].values
         self.fair_up = df["fair_up"].values
-        self.up_ask = df["up_ask"].values
-        self.up_bid = df["up_bid"].values
         self.spot = df["spot"].values
         self.strike = df["strike"].values
 
@@ -187,8 +204,12 @@ def simulate_strategy_fast(
     max_drawdown = 0.0
     max_drawdown_pct = 0.0
 
+    # In-flight asynchronous settlements tracking (matches live bot asynchronous window settlements)
+    pending_settlements: List[Dict[str, Any]] = []
+
     trades: List[Dict[str, Any]] = []
     pnl_list: List[float] = []
+    gross_pnl_list: List[float] = []
     won_list: List[bool] = []
     fees_paid = 0.0
     vetoed_count = 0
@@ -196,6 +217,8 @@ def simulate_strategy_fast(
 
     up_pnls: List[float] = []
     down_pnls: List[float] = []
+    up_gross_pnls: List[float] = []
+    down_gross_pnls: List[float] = []
     up_wons: List[bool] = []
     down_wons: List[bool] = []
 
@@ -203,6 +226,7 @@ def simulate_strategy_fast(
         s_idx = dataset.boundaries[m_i]
         e_idx = dataset.boundaries[m_i + 1]
         m_up_won = dataset.mkt_up_wons[m_i]
+        mkt_ts_start = dataset.mkt_ts_starts[m_i]
 
         active_pos = None
         for k in range(s_idx, e_idx):
@@ -211,18 +235,38 @@ def simulate_strategy_fast(
             if t_s < min_ts or t_s > max_ts or tau_s < min_seconds_left:
                 continue
 
+            current_tick_ts = mkt_ts_start + t_s
+
+            # Settle any pending trades that matured before or at this tick
+            if pending_settlements:
+                still_pending = []
+                for p_pos in pending_settlements:
+                    if p_pos["settle_ts"] <= current_tick_ts:
+                        current_balance += p_pos["payout"]
+                    else:
+                        still_pending.append(p_pos)
+                pending_settlements = still_pending
+
             fair_up = dataset.fair_up[k]
             up_ask = dataset.up_ask[k]
             up_bid = dataset.up_bid[k]
+            down_ask = dataset.down_ask[k]
+            down_bid = dataset.down_bid[k]
+
             if np.isnan(fair_up) or np.isnan(up_ask) or np.isnan(up_bid):
                 continue
+
+            # Fallback if down quotes are nan or out of range
+            if np.isnan(down_ask) or down_ask <= 0.001 or down_ask >= 0.999:
+                down_ask = 1.0 - up_bid
+            if np.isnan(down_bid) or down_bid <= 0.001 or down_bid >= 0.999:
+                down_bid = 1.0 - up_ask
+
             if up_ask <= 0.001 or up_ask >= 0.999 or up_bid <= 0.001 or up_bid >= 0.999:
                 continue
             if up_bid >= up_ask:  # Crossed or inverted quotes protection
                 continue
 
-            down_ask = 1.0 - up_bid
-            down_bid = 1.0 - up_ask
             fair_down = 1.0 - fair_up
             ev_up = fair_up - up_ask
             ev_down = fair_down - down_ask
@@ -256,7 +300,10 @@ def simulate_strategy_fast(
                         stake = float(risk_value)
 
                     # Enforce live bot minimum book liquidity check (settings.MIN_BOOK_LIQUIDITY_USD)
-                    ask_liq_shares = dataset.up_ask_size[k] if side_is_up else dataset.up_bid_size[k]
+                    ask_liq_shares = dataset.up_ask_size[k] if side_is_up else dataset.down_ask_size[k]
+                    if not np.isfinite(ask_liq_shares) or ask_liq_shares <= 0:
+                        ask_liq_shares = dataset.up_bid_size[k] if not side_is_up else dataset.up_ask_size[k]
+
                     if np.isfinite(ask_liq_shares) and ask_liq_shares > 0 and ask_side > 0:
                         ask_liq_usd = ask_liq_shares * ask_side
                         if ask_liq_usd < min_book_liquidity_usd:
@@ -275,22 +322,39 @@ def simulate_strategy_fast(
                     if not flip_enabled:
                         won = (side_is_up and m_up_won) or ((not side_is_up) and (not m_up_won))
                         payout = shares if won else 0.0
-                        trade_pnl = payout - stake - entry_fee
-                        current_balance += trade_pnl
+                        gross_pnl = payout - stake
+                        trade_pnl = gross_pnl - entry_fee
+
+                        current_balance -= stake
+                        if fees_enabled:
+                            current_balance -= entry_fee
                         fees_paid += entry_fee
+
+                        # Queue settlement at candle end + 60s
+                        settle_ts = mkt_ts_start + 900 + 60
+                        pending_settlements.append({
+                            "settle_ts": settle_ts,
+                            "payout": payout,
+                            "trade_pnl": trade_pnl
+                        })
+
                         pnl_list.append(trade_pnl)
+                        gross_pnl_list.append(gross_pnl)
                         won_list.append(won)
 
                         if side_is_up:
                             up_pnls.append(trade_pnl)
+                            up_gross_pnls.append(gross_pnl)
                             up_wons.append(won)
                         else:
                             down_pnls.append(trade_pnl)
+                            down_gross_pnls.append(gross_pnl)
                             down_wons.append(won)
 
-                        if current_balance > peak_balance:
-                            peak_balance = current_balance
-                        dd = peak_balance - current_balance
+                        total_equity = current_balance + sum(p["payout"] for p in pending_settlements)
+                        if total_equity > peak_balance:
+                            peak_balance = total_equity
+                        dd = peak_balance - total_equity
                         dd_pct = (dd / peak_balance) * 100.0 if peak_balance > 0 else 0.0
                         if dd > max_drawdown:
                             max_drawdown = dd
@@ -312,9 +376,10 @@ def simulate_strategy_fast(
                             "fee": round(entry_fee, 2),
                             "won": won,
                             "payout": round(payout, 2),
+                            "gross_pnl": round(gross_pnl, 2),
                             "pnl": round(trade_pnl, 2),
                             "return_pct": round((trade_pnl / stake) * 100.0, 2),
-                            "balance_after": round(current_balance, 2)
+                            "balance_after": round(total_equity, 2)
                         })
                         break
                     else:
@@ -331,6 +396,10 @@ def simulate_strategy_fast(
                             "fair_prob": p_side,
                             "ev": raw_ev
                         }
+                        current_balance -= stake
+                        if fees_enabled:
+                            current_balance -= entry_fee
+                        fees_paid += entry_fee
             else:
                 # Position Flip Evaluation (if enabled in config)
                 if tau_s >= flip_min_seconds:
@@ -357,14 +426,17 @@ def simulate_strategy_fast(
                             exit_proceeds = active_pos["shares"] * exit_bid
                             exit_fee = (active_pos["shares"] * fee_rate * exit_bid * (1.0 - exit_bid)) if fees_enabled else 0.0
                             leg1_pnl = exit_proceeds - active_pos["stake"] - active_pos["entry_fee"] - exit_fee
-                            current_balance += leg1_pnl
+                            current_balance += exit_proceeds - exit_fee
                             fees_paid += exit_fee
 
                             flips_count += 1
                             new_stake = (current_balance * (risk_value / 100.0)) if risk_type == "percent" else float(risk_value)
 
                             # Check liquidity for flip side
-                            opp_ask_liq_shares = dataset.up_ask_size[k] if opp_side_is_up else dataset.up_bid_size[k]
+                            opp_ask_liq_shares = dataset.up_ask_size[k] if opp_side_is_up else dataset.down_ask_size[k]
+                            if not np.isfinite(opp_ask_liq_shares) or opp_ask_liq_shares <= 0:
+                                opp_ask_liq_shares = dataset.up_bid_size[k] if not opp_side_is_up else dataset.up_ask_size[k]
+
                             if np.isfinite(opp_ask_liq_shares) and opp_ask_liq_shares > 0 and opp_ask > 0:
                                 opp_ask_liq_usd = opp_ask_liq_shares * opp_ask
                                 if opp_ask_liq_usd < min_book_liquidity_usd:
@@ -376,6 +448,11 @@ def simulate_strategy_fast(
 
                             new_shares = new_stake / opp_ask
                             new_fee = (new_shares * fee_rate * opp_ask * (1.0 - opp_ask)) if fees_enabled else 0.0
+
+                            current_balance -= new_stake
+                            if fees_enabled:
+                                current_balance -= new_fee
+                            fees_paid += new_fee
 
                             active_pos = {
                                 "side_is_up": opp_side_is_up,
@@ -396,17 +473,20 @@ def simulate_strategy_fast(
             side_is_up = active_pos["side_is_up"]
             won = (side_is_up and m_up_won) or ((not side_is_up) and (not m_up_won))
             payout = active_pos["shares"] if won else 0.0
-            trade_pnl = payout - active_pos["stake"] - active_pos["entry_fee"]
-            current_balance += trade_pnl
-            fees_paid += active_pos["entry_fee"]
+            gross_pnl = payout - active_pos["stake"]
+            trade_pnl = gross_pnl - active_pos["entry_fee"]
+            current_balance += payout
             pnl_list.append(trade_pnl)
+            gross_pnl_list.append(gross_pnl)
             won_list.append(won)
 
             if side_is_up:
                 up_pnls.append(trade_pnl)
+                up_gross_pnls.append(gross_pnl)
                 up_wons.append(won)
             else:
                 down_pnls.append(trade_pnl)
+                down_gross_pnls.append(gross_pnl)
                 down_wons.append(won)
 
             if current_balance > peak_balance:
@@ -433,10 +513,16 @@ def simulate_strategy_fast(
                 "fee": round(active_pos["entry_fee"], 2),
                 "won": won,
                 "payout": round(payout, 2),
+                "gross_pnl": round(gross_pnl, 2),
                 "pnl": round(trade_pnl, 2),
                 "return_pct": round((trade_pnl / active_pos["stake"]) * 100.0, 2),
                 "balance_after": round(current_balance, 2)
             })
+
+    # Settle any remaining in-flight positions at backtest conclusion
+    for p_pos in pending_settlements:
+        current_balance += p_pos["payout"]
+    pending_settlements.clear()
 
     n = len(pnl_list)
     if n == 0:
@@ -449,6 +535,7 @@ def simulate_strategy_fast(
             "losing_trades": 0,
             "win_rate": 0.0,
             "profit_factor": 0.0,
+            "gross_profit": 0.0,
             "net_pnl": 0.0,
             "total_return_pct": 0.0,
             "final_balance": round(initial_balance, 2),
@@ -465,9 +552,11 @@ def simulate_strategy_fast(
             "up_trades": 0,
             "up_win_rate": 0.0,
             "up_pnl": 0.0,
+            "up_gross_pnl": 0.0,
             "down_trades": 0,
             "down_win_rate": 0.0,
             "down_pnl": 0.0,
+            "down_gross_pnl": 0.0,
             "trades_df": pd.DataFrame()
         }
 
@@ -475,6 +564,7 @@ def simulate_strategy_fast(
     losses = [abs(p) for p in pnl_list if p <= 0]
     win_rate = (len(wins) / n) * 100.0
     net_pnl = current_balance - initial_balance
+    gross_profit = sum(gross_pnl_list)
     total_return_pct = (net_pnl / initial_balance) * 100.0
 
     gross_win = sum(wins) if wins else 0.0
@@ -500,6 +590,7 @@ def simulate_strategy_fast(
         "losing_trades": len(losses),
         "win_rate": round(win_rate, 2),
         "profit_factor": round(pf, 2),
+        "gross_profit": round(gross_profit, 2),
         "net_pnl": round(net_pnl, 2),
         "total_return_pct": round(total_return_pct, 2),
         "final_balance": round(current_balance, 2),
@@ -516,9 +607,11 @@ def simulate_strategy_fast(
         "up_trades": len(up_pnls),
         "up_win_rate": round(float(np.mean(up_wons)) * 100.0, 1) if up_wons else 0.0,
         "up_pnl": round(sum(up_pnls), 2),
+        "up_gross_pnl": round(sum(up_gross_pnls), 2),
         "down_trades": len(down_pnls),
         "down_win_rate": round(float(np.mean(down_wons)) * 100.0, 1) if down_wons else 0.0,
         "down_pnl": round(sum(down_pnls), 2),
+        "down_gross_pnl": round(sum(down_gross_pnls), 2),
         "trades_df": pd.DataFrame(trades)
     }
 
@@ -546,6 +639,7 @@ def run_simulation(data_path: str, config: Dict[str, Any]) -> Dict[str, Any]:
             "veto_count": res.get("vetoed_count", 0),
             "initial_balance": float(config.get("initial_balance", 1000.0)),
             "final_balance": res["final_balance"],
+            "gross_profit": res.get("gross_profit", 0.0),
             "net_profit": res["net_pnl"],
             "total_return_pct": res["total_return_pct"],
             "peak_balance": res["peak_balance"],
@@ -565,8 +659,8 @@ def run_simulation(data_path: str, config: Dict[str, Any]) -> Dict[str, Any]:
             "sharpe_ratio": res["sharpe_ratio"]
         },
         "breakdown_side": {
-            "UP": {"trades": res.get("up_trades", 0), "win_rate": res.get("up_win_rate", 0), "pnl": res.get("up_pnl", 0)},
-            "DOWN": {"trades": res.get("down_trades", 0), "win_rate": res.get("down_win_rate", 0), "pnl": res.get("down_pnl", 0)}
+            "UP": {"trades": res.get("up_trades", 0), "win_rate": res.get("up_win_rate", 0), "pnl": res.get("up_pnl", 0), "gross_pnl": res.get("up_gross_pnl", 0)},
+            "DOWN": {"trades": res.get("down_trades", 0), "win_rate": res.get("down_win_rate", 0), "pnl": res.get("down_pnl", 0), "gross_pnl": res.get("down_gross_pnl", 0)}
         },
         "trades_df": res.get("trades_df", pd.DataFrame())
     }
@@ -595,7 +689,8 @@ def export_results(results: Dict[str, Any], output_dir: str):
         "| :--- | :--- |",
         f"| **Initial Capital** | ${s.get('initial_balance'):,.2f} |",
         f"| **Final Capital** | ${s.get('final_balance'):,.2f} |",
-        f"| **Net Profit** | **${s.get('net_profit'):+,.2f}** ({s.get('total_return_pct'):+.2f}%) |",
+        f"| **Gross Profit (Paper Parity)** | **${s.get('gross_profit', 0.0):+,.2f}** |",
+        f"| **Net Profit (After Fees)** | **${s.get('net_profit'):+,.2f}** ({s.get('total_return_pct'):+.2f}%) |",
         f"| **Peak Capital** | ${s.get('peak_balance'):,.2f} |",
         f"| **Max Drawdown** | -${s.get('max_drawdown'):,.2f} (-{s.get('max_drawdown_pct'):.2f}%) |",
         f"| **Total Evaluated Markets** | {s.get('markets_evaluated'):,} |",
@@ -610,10 +705,10 @@ def export_results(results: Dict[str, Any], output_dir: str):
         f"| **Total Taker Fees Paid** | ${s.get('total_fees_paid'):.2f} |",
         f"| **Annualized Sharpe Ratio** | {s.get('sharpe_ratio')} |",
         "\n## 2. Directional Performance",
-        "| Direction | Trades | Win Rate | Total PnL |",
-        "| :--- | :--- | :--- | :--- |",
-        f"| **UP** | {b_side.get('UP', {}).get('trades')} | {b_side.get('UP', {}).get('win_rate')}% | ${b_side.get('UP', {}).get('pnl'):+,.2f} |",
-        f"| **DOWN** | {b_side.get('DOWN', {}).get('trades')} | {b_side.get('DOWN', {}).get('win_rate')}% | ${b_side.get('DOWN', {}).get('pnl'):+,.2f} |",
+        "| Direction | Trades | Win Rate | Gross PnL | Net PnL |",
+        "| :--- | :--- | :--- | :--- | :--- |",
+        f"| **UP** | {b_side.get('UP', {}).get('trades')} | {b_side.get('UP', {}).get('win_rate')}% | ${b_side.get('UP', {}).get('gross_pnl', 0):+,.2f} | ${b_side.get('UP', {}).get('pnl'):+,.2f} |",
+        f"| **DOWN** | {b_side.get('DOWN', {}).get('trades')} | {b_side.get('DOWN', {}).get('win_rate')}% | ${b_side.get('DOWN', {}).get('gross_pnl', 0):+,.2f} | ${b_side.get('DOWN', {}).get('pnl'):+,.2f} |",
         "\n---\n*Backtest generated using TOG-main quantitative simulation engine.*"
     ]
     with open(out / "summary_report.md", "w", encoding="utf-8") as f:

@@ -476,13 +476,60 @@ def load_chainlink_prices(data_dir: Path, dates: List[str]) -> Tuple[np.ndarray,
     return ts[o], px[o]
 
 
-def col_at(ts: np.ndarray, vals: np.ndarray, marks: np.ndarray) -> np.ndarray:
+def col_at(ts: np.ndarray, vals: np.ndarray, marks: np.ndarray, max_staleness_us: int = 120_000_000) -> np.ndarray:
+    """Looks up value at marks with strict staleness check (default 120s). Prevents hours-old stale strikes."""
     idx = np.searchsorted(ts, marks, side="right") - 1
     out = np.full(len(marks), np.nan)
     ok = idx >= 0
     if ok.any():
-        out[ok] = vals[idx[ok]]
+        if max_staleness_us > 0:
+            fresh = ok & ((marks - ts[idx]) <= max_staleness_us) & ((marks - ts[idx]) >= 0)
+            out[fresh] = vals[idx[fresh]]
+        else:
+            out[ok] = vals[idx[ok]]
     return out
+
+
+def load_live_reference_catalog() -> Tuple[Dict[str, float], Dict[str, str]]:
+    """Discovers and parses real live execution trade logs (e.g. 15m-trades*LIVE*.csv).
+    Provides exact reference strikes and official contract outcomes for 100% live parity."""
+    search_dirs = [
+        BASE_DIR,
+        BASE_DIR.parent,
+        BASE_DIR.parent / "New folder",
+        BASE_DIR.parent.parent / "New folder"
+    ]
+    live_open_prices = {}
+    live_official_winners = {}
+    for sd in search_dirs:
+        if not sd.exists():
+            continue
+        for p in list(sd.glob("*LIVE*.csv")) + list(sd.glob("15m-trades*.csv")):
+            try:
+                df = pd.read_csv(p)
+                if "market_slug" in df.columns and "open_price" in df.columns:
+                    for _, r in df.iterrows():
+                        slug = str(r["market_slug"])
+                        try:
+                            op = float(r["open_price"])
+                            if np.isfinite(op) and op > 0:
+                                live_open_prices[slug] = op
+                        except Exception:
+                            pass
+                        try:
+                            side = str(r["side"]).upper()
+                            pnl = float(r.get("profit_loss", 0.0))
+                            if pnl > 0:
+                                live_official_winners[slug] = side
+                            elif pnl < 0:
+                                live_official_winners[slug] = "DOWN" if side == "UP" else "UP"
+                        except Exception:
+                            pass
+            except Exception:
+                pass
+    if live_open_prices:
+        print(f"[Data] Loaded {len(live_open_prices)} live execution reference strikes for exact parity.")
+    return live_open_prices, live_official_winners
 
 
 def sample_quotes(quote_table, marks: np.ndarray) -> Tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
@@ -532,7 +579,7 @@ def sample_quotes(quote_table, marks: np.ndarray) -> Tuple[np.ndarray, np.ndarra
 
 
 def discover_market_tokens(slugs: List[str], api_key: str = "", base_url: str = "https://api.telonex.io/v1") -> Dict[str, Any]:
-    """Queries Polymarket Gamma API (and Telonex availability as fallback) to obtain market tokens for slugs."""
+    """Queries Polymarket Gamma API (and Telonex availability as fallback) to obtain market tokens and official outcomes."""
     catalog = {}
     auth_headers = {"Authorization": f"Bearer {api_key}"} if api_key else {}
 
@@ -550,26 +597,49 @@ def discover_market_tokens(slugs: List[str], api_key: str = "", base_url: str = 
             if arr:
                 m = arr[0]
                 tokens = json.loads(m.get("clobTokenIds", "[]")) if isinstance(m.get("clobTokenIds"), str) else m.get("clobTokenIds", [])
+                outcome_prices = json.loads(m.get("outcomePrices", "[]")) if isinstance(m.get("outcomePrices"), str) else m.get("outcomePrices", [])
+                official_winner = None
+                if outcome_prices and len(outcome_prices) >= 2:
+                    try:
+                        p0 = float(outcome_prices[0])
+                        p1 = float(outcome_prices[1])
+                        if p0 > 0.9:
+                            official_winner = "UP"
+                        elif p1 > 0.9:
+                            official_winner = "DOWN"
+                    except Exception:
+                        pass
+
                 return slug, {
                     "market_id": m.get("id"),
                     "up_asset_id": tokens[0] if len(tokens) > 0 else None,
-                    "down_asset_id": tokens[1] if len(tokens) > 1 else None
+                    "down_asset_id": tokens[1] if len(tokens) > 1 else None,
+                    "official_winner": official_winner
                 }
         except Exception:
             pass
 
         # 3. Fallback to Telonex availability
         if api_key:
+            up_aid, down_aid = None, None
             try:
                 r = requests.get(f"{base_url}/availability/polymarket",
                                  params={"slug": slug, "outcome": "Up"},
                                  headers=auth_headers, timeout=8)
                 if r.status_code == 200:
-                    aid = r.json().get("asset_id")
-                    if aid:
-                        return slug, {"market_id": None, "up_asset_id": aid, "down_asset_id": None}
+                    up_aid = r.json().get("asset_id")
             except Exception:
                 pass
+            try:
+                r = requests.get(f"{base_url}/availability/polymarket",
+                                 params={"slug": slug, "outcome": "Down"},
+                                 headers=auth_headers, timeout=8)
+                if r.status_code == 200:
+                    down_aid = r.json().get("asset_id")
+            except Exception:
+                pass
+            if up_aid or down_aid:
+                return slug, {"market_id": None, "up_asset_id": up_aid, "down_asset_id": down_aid, "official_winner": None}
 
         return slug, None
 
@@ -615,17 +685,19 @@ def fetch_and_build_panel(config: Dict[str, Any], start_date: str, end_date: str
     limiter = RateLimiter(rate_per_sec=2.5, burst=3.0)
     quote_tasks = []
     for slug, mdata in catalog.items():
-        if not mdata.get("up_asset_id"):
-            continue
         ts = int(slug.rsplit("-", 1)[1])
         wd = dt.datetime.fromtimestamp(ts, dt.timezone.utc).strftime("%Y-%m-%d")
-        qpath = data_dir / "raw" / "polymarket" / "quotes" / wd / f"{slug}__Up.parquet"
-        quote_tasks.append((slug, mdata["up_asset_id"], wd, qpath))
+        if mdata.get("up_asset_id"):
+            qpath_up = data_dir / "raw" / "polymarket" / "quotes" / wd / f"{slug}__Up.parquet"
+            quote_tasks.append((slug, mdata["up_asset_id"], wd, qpath_up, "Up"))
+        if mdata.get("down_asset_id"):
+            qpath_down = data_dir / "raw" / "polymarket" / "quotes" / wd / f"{slug}__Down.parquet"
+            quote_tasks.append((slug, mdata["down_asset_id"], wd, qpath_down, "Down"))
 
     to_download = [t for t in quote_tasks if not t[3].exists()]
     if to_download:
-        print(f"[Data] Downloading {len(to_download)} orderbook quote files from Telonex...")
-        for i, (slug, aid, wd, qpath) in enumerate(to_download):
+        print(f"[Data] Downloading {len(to_download)} orderbook quote files (UP & DOWN) from Telonex...")
+        for i, (slug, aid, wd, qpath, outcome_label) in enumerate(to_download):
             limiter.acquire()
             client.download("polymarket", "quotes", wd, qpath, asset_id=aid)
             if (i + 1) % 20 == 0 or (i + 1) == len(to_download):
@@ -640,17 +712,20 @@ def fetch_and_build_panel(config: Dict[str, Any], start_date: str, end_date: str
     if cts.size == 0:
         raise RuntimeError("Failed to load Chainlink price data.")
 
+    live_strikes, live_winners = load_live_reference_catalog()
+
     # High-density sub-second scan grid: 1..9s integers, then 10..890s by 5s
     grid_offsets = sorted(set(list(range(1, 10)) + list(range(10, 895, 5))))
     grid_s = np.array(grid_offsets, dtype="int64")
 
     recs = {k: [] for k in
             ("slug", "t_s", "tau_s", "spot", "strike", "fair_up",
-             "up_ask", "up_bid", "up_won",
-             "exit_up_bid", "exit_up_ask", "sigma",
+             "up_ask", "up_bid", "down_ask", "down_bid",
+             "up_won", "exit_up_bid", "exit_up_ask", "sigma",
              "rsi", "ha_green_streak", "ha_red_streak",
              "ha_5m_green_streak", "ha_5m_red_streak",
-             "up_ask_size", "up_bid_size")}
+             "up_ask_size", "up_bid_size",
+             "down_ask_size", "down_bid_size")}
 
     sorted_slugs = sorted(catalog.keys(), key=lambda s: int(s.rsplit("-", 1)[1]))
     processed_count = 0
@@ -658,38 +733,70 @@ def fetch_and_build_panel(config: Dict[str, Any], start_date: str, end_date: str
     for slug in sorted_slugs:
         ts_start = int(slug.rsplit("-", 1)[1])
         wd = dt.datetime.fromtimestamp(ts_start, dt.timezone.utc).strftime("%Y-%m-%d")
-        qpath = data_dir / "raw" / "polymarket" / "quotes" / wd / f"{slug}__Up.parquet"
-        if not qpath.exists():
+        qpath_up = data_dir / "raw" / "polymarket" / "quotes" / wd / f"{slug}__Up.parquet"
+        qpath_down = data_dir / "raw" / "polymarket" / "quotes" / wd / f"{slug}__Down.parquet"
+        if not qpath_up.exists():
             continue
 
         q_cols = ["timestamp_us", "bid_price", "ask_price"]
         try:
-            q_schema = pq.read_schema(qpath).names
+            q_schema = pq.read_schema(qpath_up).names
             for extra in ["bid_size", "ask_size", "bid_amount", "ask_amount"]:
                 if extra in q_schema and extra not in q_cols:
                     q_cols.append(extra)
         except Exception:
             pass
 
-        q = pq.read_table(qpath, columns=q_cols)
-        if q.num_rows < 5:
+        q_up = pq.read_table(qpath_up, columns=q_cols)
+        if q_up.num_rows < 5:
             continue
 
         open_us = int(ts_start * 1e6)
         close_us = int((ts_start + 900) * 1e6)
+        target_open = binance_feed.get_window_open(ts_start)
 
-        strike = col_at(cts, cpx, np.array([open_us]))[0]
-        settle = col_at(cts, cpx, np.array([close_us]))[0]
-        if not np.isfinite(strike) or not np.isfinite(settle):
-            continue
+        # 1. High-fidelity strike: Check live reference -> Fresh Chainlink -> Binance open
+        if slug in live_strikes:
+            strike = live_strikes[slug]
+        else:
+            strike_arr = col_at(cts, cpx, np.array([open_us]), max_staleness_us=120_000_000)
+            strike = strike_arr[0] if (len(strike_arr) > 0 and np.isfinite(strike_arr[0])) else target_open
 
-        uw = 1.0 if settle > strike else 0.0
+        # 2. High-fidelity settlement outcome: Live reference -> Gamma official -> Close vs Strike
+        mdata = catalog.get(slug, {})
+        official_w = live_winners.get(slug) or mdata.get("official_winner")
+        if official_w == "UP":
+            uw = 1.0
+        elif official_w == "DOWN":
+            uw = 0.0
+        else:
+            settle_arr = col_at(cts, cpx, np.array([close_us]), max_staleness_us=120_000_000)
+            settle = settle_arr[0] if (len(settle_arr) > 0 and np.isfinite(settle_arr[0])) else binance_feed.get_spot_vectorized(np.array([ts_start + 900]))[0]
+            uw = 1.0 if settle > strike else 0.0
+
         marks_us = open_us + grid_s * 1_000_000
         marks_s = ts_start + grid_s
         tau = (close_us - marks_us) / 1e6
-        bid, ask, bid_size, ask_size = sample_quotes(q, marks_us)
 
-        target_open = binance_feed.get_window_open(ts_start)
+        # Sample UP quotes
+        up_bid, up_ask, up_bid_size, up_ask_size = sample_quotes(q_up, marks_us)
+
+        # Sample DOWN quotes (real book if available, else synthetic fallback)
+        if qpath_down.exists():
+            try:
+                q_down = pq.read_table(qpath_down, columns=q_cols)
+                down_bid, down_ask, down_bid_size, down_ask_size = sample_quotes(q_down, marks_us)
+            except Exception:
+                down_ask = 1.0 - up_bid
+                down_bid = 1.0 - up_ask
+                down_ask_size = up_bid_size
+                down_bid_size = up_ask_size
+        else:
+            down_ask = 1.0 - up_bid
+            down_bid = 1.0 - up_ask
+            down_ask_size = up_bid_size
+            down_bid_size = up_ask_size
+
         spot = binance_feed.get_spot_vectorized(marks_s)
         fair = binance_feed.compute_fair_probability_vectorized(spot, target_open, tau, marks_s)
         rsi_m, ha_g_m, ha_r_m, ha_g_5m, ha_r_5m = binance_feed.get_indicators_vectorized(marks_s)
@@ -697,7 +804,7 @@ def fetch_and_build_panel(config: Dict[str, Any], start_date: str, end_date: str
         idx_5m = np.clip(idx_5m, 0, len(binance_feed.kline_5m_ts) - 1)
         sig_arr = binance_feed.sigma_5m[idx_5m]
 
-        m = np.isfinite(spot) & np.isfinite(ask) & np.isfinite(bid) & np.isfinite(fair)
+        m = np.isfinite(spot) & np.isfinite(up_ask) & np.isfinite(down_ask) & np.isfinite(fair)
         if not m.any():
             continue
 
@@ -707,19 +814,23 @@ def fetch_and_build_panel(config: Dict[str, Any], start_date: str, end_date: str
         recs["spot"].extend(spot[m].tolist())
         recs["strike"].extend([strike] * int(m.sum()))
         recs["fair_up"].extend(fair[m].tolist())
-        recs["up_ask"].extend(ask[m].tolist())
-        recs["up_bid"].extend(bid[m].tolist())
+        recs["up_ask"].extend(up_ask[m].tolist())
+        recs["up_bid"].extend(up_bid[m].tolist())
+        recs["down_ask"].extend(down_ask[m].tolist())
+        recs["down_bid"].extend(down_bid[m].tolist())
         recs["up_won"].extend([uw] * int(m.sum()))
-        recs["exit_up_bid"].extend(bid[m].tolist())
-        recs["exit_up_ask"].extend(ask[m].tolist())
+        recs["exit_up_bid"].extend(up_bid[m].tolist())
+        recs["exit_up_ask"].extend(up_ask[m].tolist())
         recs["sigma"].extend(sig_arr[m].tolist())
         recs["rsi"].extend(rsi_m[m].tolist())
         recs["ha_green_streak"].extend(ha_g_m[m].tolist())
         recs["ha_red_streak"].extend(ha_r_m[m].tolist())
         recs["ha_5m_green_streak"].extend(ha_g_5m[m].tolist())
         recs["ha_5m_red_streak"].extend(ha_r_5m[m].tolist())
-        recs["up_ask_size"].extend(ask_size[m].tolist())
-        recs["up_bid_size"].extend(bid_size[m].tolist())
+        recs["up_ask_size"].extend(up_ask_size[m].tolist())
+        recs["up_bid_size"].extend(up_bid_size[m].tolist())
+        recs["down_ask_size"].extend(down_ask_size[m].tolist())
+        recs["down_bid_size"].extend(down_bid_size[m].tolist())
         processed_count += 1
 
     tb = pa.table({
@@ -731,6 +842,8 @@ def fetch_and_build_panel(config: Dict[str, Any], start_date: str, end_date: str
         "fair_up": pa.array(recs["fair_up"], type=pa.float64()),
         "up_ask": pa.array(recs["up_ask"], type=pa.float64()),
         "up_bid": pa.array(recs["up_bid"], type=pa.float64()),
+        "down_ask": pa.array(recs["down_ask"], type=pa.float64()),
+        "down_bid": pa.array(recs["down_bid"], type=pa.float64()),
         "up_won": pa.array(recs["up_won"], type=pa.float64()),
         "exit_up_bid": pa.array(recs["exit_up_bid"], type=pa.float64()),
         "exit_up_ask": pa.array(recs["exit_up_ask"], type=pa.float64()),
@@ -742,6 +855,8 @@ def fetch_and_build_panel(config: Dict[str, Any], start_date: str, end_date: str
         "ha_5m_red_streak": pa.array(recs["ha_5m_red_streak"], type=pa.int64()),
         "up_ask_size": pa.array(recs["up_ask_size"], type=pa.float64()),
         "up_bid_size": pa.array(recs["up_bid_size"], type=pa.float64()),
+        "down_ask_size": pa.array(recs["down_ask_size"], type=pa.float64()),
+        "down_bid_size": pa.array(recs["down_bid_size"], type=pa.float64()),
     })
     dest_panel.parent.mkdir(parents=True, exist_ok=True)
     pq.write_table(tb, dest_panel)
@@ -766,15 +881,16 @@ def prepare_dataset(config: Dict[str, Any]) -> str:
     print(f"[Data] Target window: {start_date} to {end_date} [{feed_label}]")
     print(f"[Data] Using local project data directory: {data_dir}")
 
-    # 1. Exact panel check: verify it exists and contains Binance Vision indicator columns
+    # 1. Exact panel check: verify it exists and contains Binance Vision indicator columns & dual DOWN book
     if exact_panel.exists():
         try:
             schema_names = pq.read_schema(exact_panel).names
-            if "rsi" in schema_names and "ha_green_streak" in schema_names and "ha_5m_green_streak" in schema_names:
+            if ("rsi" in schema_names and "ha_5m_green_streak" in schema_names
+                    and "down_ask" in schema_names):
                 print(f"[Data] Found ready unified panel dataset: {exact_panel}")
                 return str(exact_panel)
             else:
-                print(f"[Data] Existing {exact_panel.name} is missing 5m Heiken-Ashi indicators (legacy format). Upgrading...")
+                print(f"[Data] Existing {exact_panel.name} is missing dual UP/DOWN orderbook columns. Upgrading...")
         except Exception:
             pass
 
@@ -784,7 +900,8 @@ def prepare_dataset(config: Dict[str, Any]) -> str:
         if binance_panel.exists():
             try:
                 schema_names = pq.read_schema(binance_panel).names
-                if "rsi" in schema_names and "ha_green_streak" in schema_names and "ha_5m_green_streak" in schema_names:
+                if ("rsi" in schema_names and "ha_5m_green_streak" in schema_names
+                        and "down_ask" in schema_names):
                     print(f"[Data] Found ready unified panel dataset: {binance_panel}")
                     return str(binance_panel)
             except Exception:

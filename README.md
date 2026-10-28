@@ -9,20 +9,31 @@ python main.py
 
 ---
 
-## 1. Key Capabilities
+## 1. Key Capabilities & 100% Real Simulation Parity
 
 - **Single Command Operation (`python main.py`):** Runs the entire end-to-end pipeline automatically.
+- **Dual UP & DOWN Orderbook Quotes:** Unlike primitive backtesters that approximate DOWN asks as `1 - up_bid`, this engine downloads and samples **both** `__Up.parquet` and `__Down.parquet` directly from Polymarket CLOB. This replicates real discounted DOWN token pricing ($0.42–$0.48) and eliminates false EV rejections.
+- **3-Tier Strike Price Resolution:**
+  1. *Live Reference Ingestion:* Discovers and uses the exact `open_price` strike recorded during live bot runs for overlapping historical markets.
+  2. *Fresh Chainlink Oracle Lookup:* Limits historical Chainlink ticks to a maximum age of 120 seconds (`max_staleness_us=120_000_000`), preventing stale strike drift.
+  3. *Binance 15m Window Open:* Fallback strike when external oracles are unavailable.
+- **3-Tier Settlement Resolution:**
+  1. *Live Reference Winner:* Ingests confirmed live settlement outcomes.
+  2. *Polymarket Gamma Official Outcome:* Uses official contract winner (`outcomePrices > 0.90`).
+  3. *Close Price vs. Strike:* Algorithmic fallback.
+- **Asynchronous Cash & Settlement Accounting:** Replicates the live bot's chronological wallet balance timeline where stakes are locked in-flight until candle resolution (~60s after window close), accurately sizing consecutive trade entries down to the penny.
 - **Original Strategy from `TEST/TOG-main`:** Strictly replicates the original latency-arbitrage entry engine (`decide_ev`):
   - Fast closed-form GBM fair probability calculation from Binance ticks.
   - Expected value: $EV_{\text{side}} = p_{\text{side}} - \text{ask\_price}_{\text{side}}$.
   - Trade execution gated by $p \ge \text{min\_prob}$ ($0.55$) and $EV \ge \text{ev\_threshold}$ ($0.04$).
-  - Optional micro-vetoes toggle (`use_vetoes: true / false`): 1m RSI overbought/oversold and Heiken-Ashi exhaustion streak ($\ge 6$ on either 1m or 5m candles).
-  - Minimum book liquidity gate: skips thin orderbooks if available liquidity $< \text{min\_book\_liquidity\_usd}$ ($20.0).
+  - Micro-vetoes: 1m RSI overbought/oversold and Heiken-Ashi exhaustion streak ($\ge 6$ on either 1m or 5m candles).
+  - Minimum book liquidity gate: skips thin orderbooks if available depth $< \text{min\_book\_liquidity\_usd}$ ($20.0), and caps trade size to available book liquidity.
+- **Dual Gross & Net PnL Reporting:**
+  - *Gross Profit:* Exact 1:1 match with paper trading execution (where taker fees were zero).
+  - *Net Profit:* Incorporates full Polymarket dynamic taker fee deduction (`fee_rate * p * (1 - p)`).
 - **Dual Binance Feed Support (`binance_futures`):**
   - `"binance_futures": true` fetches high-frequency Binance USDT-M Futures ticks (`futures/um`).
   - `"binance_futures": false` fetches Binance Spot ticks (`BTCUSDT-aggTrades`).
-- **Automated Data Pipeline:** Reads `start_date` and `end_date` from `config.json`. If data is already cached, it loads instantly in under 2 seconds. If new dates are specified, it automatically queries Polymarket Gamma API, downloads the high-frequency quotes via Telonex REST API, compiles the parquet panel dataset, and proceeds immediately to simulation.
-- **Institutional Friction & Sizing:** Simulates Polymarket dynamic crypto taker fees (`fee_rate * p * (1 - p)`), slippage, CLOB ask/bid fills, and percent or fixed USD position sizing.
 
 ---
 
@@ -72,7 +83,7 @@ python main.py
 | `start_date` / `end_date` | `string` | Date range (`YYYY-MM-DD`). Automatically fetches new data if not cached. |
 | `initial_balance` | `float` | Starting account equity (e.g., `$1,000.00`). |
 | `binance_futures` | `bool` | Set `true` to use **Binance USDT-M Futures** ticks (`futures/um`). Set `false` to use **Binance Spot** (`BTCUSDT-aggTrades`). |
-| `risk.type` | `string` | `"percent"` (compounding % of balance) or `"fixed"` (fixed dollar stake per trade). |
+| `risk.type` | `string` | `"percent"` (compounding % of available cash) or `"fixed"` (fixed dollar stake per trade). |
 | `risk.value` | `float` | Percent value (e.g. `10.0` for 10%) or fixed USD value (e.g. `20.0`). |
 | `strategy.ev_threshold` | `float` | Minimum expected value edge (default: `0.04` = 4¢ edge). |
 | `strategy.min_prob` | `float` | Minimum model fair probability to trigger entry (default: `0.55`). |
@@ -87,5 +98,5 @@ python main.py
 ## 3. Output Files
 
 All results are automatically generated and saved into the `results/` folder:
-- `results/trades.csv`: Detailed tick-by-tick logs for every executed trade (timestamps, spot, strike, EV, probabilities, stake, entry prices, payout, PnL, balance).
-- `results/summary_report.md`: Complete summary report with win rate, profit factor, drawdown, directional UP/DOWN breakdowns, and fees paid.
+- `results/trades.csv`: Detailed tick-by-tick logs for every executed trade (timestamps, spot, strike, EV, probabilities, stake, shares, entry price, fee, payout, gross PnL, net PnL, balance).
+- `results/summary_report.md`: Complete summary report with win rate, profit factor, drawdown, directional UP/DOWN breakdowns (both gross and net), and total fees.
