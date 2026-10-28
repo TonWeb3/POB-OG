@@ -596,24 +596,33 @@ def discover_market_tokens(slugs: List[str], api_key: str = "", base_url: str = 
                 arr = r.json() if r.status_code == 200 else []
             if arr:
                 m = arr[0]
+                outcomes = json.loads(m.get("outcomes", "[]")) if isinstance(m.get("outcomes"), str) else m.get("outcomes", [])
                 tokens = json.loads(m.get("clobTokenIds", "[]")) if isinstance(m.get("clobTokenIds"), str) else m.get("clobTokenIds", [])
                 outcome_prices = json.loads(m.get("outcomePrices", "[]")) if isinstance(m.get("outcomePrices"), str) else m.get("outcomePrices", [])
+
+                outcomes_upper = [str(o).upper() for o in outcomes]
+                up_idx = outcomes_upper.index("UP") if "UP" in outcomes_upper else 0
+                down_idx = outcomes_upper.index("DOWN") if "DOWN" in outcomes_upper else 1
+
+                up_asset_id = tokens[up_idx] if len(tokens) > up_idx else None
+                down_asset_id = tokens[down_idx] if len(tokens) > down_idx else None
+
                 official_winner = None
-                if outcome_prices and len(outcome_prices) >= 2:
+                if outcome_prices and len(outcome_prices) > max(up_idx, down_idx):
                     try:
-                        p0 = float(outcome_prices[0])
-                        p1 = float(outcome_prices[1])
-                        if p0 > 0.9:
+                        p_up = float(outcome_prices[up_idx])
+                        p_down = float(outcome_prices[down_idx])
+                        if p_up > 0.9:
                             official_winner = "UP"
-                        elif p1 > 0.9:
+                        elif p_down > 0.9:
                             official_winner = "DOWN"
                     except Exception:
                         pass
 
                 return slug, {
                     "market_id": m.get("id"),
-                    "up_asset_id": tokens[0] if len(tokens) > 0 else None,
-                    "down_asset_id": tokens[1] if len(tokens) > 1 else None,
+                    "up_asset_id": up_asset_id,
+                    "down_asset_id": down_asset_id,
                     "official_winner": official_winner
                 }
         except Exception:
