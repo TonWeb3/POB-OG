@@ -1,8 +1,7 @@
 {
   "start_date": "2026-10-18",
   "end_date": "2026-10-25",
-  "initial_balance": 1000.0,
-  "binance_futures": true,
+  "initial_balance": 1000,
   "risk": {
     "type": "percent",
     "value": 10.0
@@ -10,14 +9,12 @@
   "strategy": {
     "ev_threshold": 0.04,
     "min_prob": 0.55,
-    "min_entry_second": 0,
-    "max_entry_second": 880,
     "min_seconds_left": 20,
     "min_book_liquidity_usd": 20.0
   },
   "use_vetoes": true,
   "fees": {
-    "enabled": true,
+    "enabled": false,
     "fee_rate": 0.07
   },
   "flip": {

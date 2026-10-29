@@ -22,13 +22,12 @@ from fetch_data import load_config, prepare_dataset
 from backtest import run_simulation, export_results
 
 
-def print_banner(binance_futures: bool = True, use_vetoes: bool = True):
-    feed_label = "BINANCE FUTURES" if binance_futures else "BINANCE SPOT"
+def print_banner(use_vetoes: bool = True):
     veto_label = "VETOES ON" if use_vetoes else "VETOES OFF"
     banner = f"""
 ================================================================================
           TOG-MAIN POLYMARKET BTC 15M QUANTITATIVE ENGINE
-          [ORIGINAL LATENCY-ARB EV STRATEGY | {feed_label} | {veto_label}]
+          [ORIGINAL LATENCY-ARB EV STRATEGY | BINANCE SPOT | {veto_label}]
 ================================================================================
     """
     print(banner)
@@ -77,9 +76,8 @@ def main():
         sys.exit(1)
 
     cfg = load_config(str(cfg_path))
-    binance_futures = bool(cfg.get("binance_futures", True))
     use_vetoes = bool(cfg.get("use_vetoes", True))
-    print_banner(binance_futures, use_vetoes)
+    print_banner(use_vetoes)
 
     output_dir = CURRENT_DIR / cfg.get("output_dir", "results")
 

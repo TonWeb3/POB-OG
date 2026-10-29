@@ -185,9 +185,6 @@ def simulate_strategy_fast(
 
     ev_th = float(strat_cfg.get("ev_threshold", 0.04))
     min_prob = float(strat_cfg.get("min_prob", 0.55))
-    min_ts = int(strat_cfg.get("min_entry_second", 0) or 0)
-    raw_max_ts = strat_cfg.get("max_entry_second")
-    max_ts = int(raw_max_ts) if (raw_max_ts is not None and int(raw_max_ts) > 0) else 880
     min_seconds_left = int(strat_cfg.get("min_seconds_left", 20))
     min_book_liquidity_usd = float(strat_cfg.get("min_book_liquidity_usd", 20.0))
 
@@ -232,7 +229,7 @@ def simulate_strategy_fast(
         for k in range(s_idx, e_idx):
             t_s = dataset.t_s[k]
             tau_s = dataset.tau_s[k]
-            if t_s < min_ts or t_s > max_ts or tau_s < min_seconds_left:
+            if tau_s < min_seconds_left:
                 continue
 
             current_tick_ts = mkt_ts_start + t_s
@@ -294,6 +291,7 @@ def simulate_strategy_fast(
 
                 # Gates: EV >= ev_threshold AND prob >= min_prob
                 if raw_ev >= ev_th and p_side >= min_prob:
+
                     if risk_type == "percent":
                         stake = current_balance * (risk_value / 100.0)
                     else:
@@ -676,6 +674,16 @@ def export_results(results: Dict[str, Any], output_dir: str):
     if "trades_df" in results and not results["trades_df"].empty:
         results["trades_df"].to_csv(out / "trades.csv", index=False)
         print(f"[Results] Exported trades log: {out / 'trades.csv'}")
+
+        # Mirror to New folder/trades BACKTEST.csv if present
+        for candidate in [BASE_DIR.parent / "New folder", BASE_DIR.parent.parent / "New folder"]:
+            if candidate.exists():
+                try:
+                    mirror_file = candidate / "trades BACKTEST.csv"
+                    results["trades_df"].to_csv(mirror_file, index=False)
+                    print(f"[Results] Mirrored live-parity backtest trades to: {mirror_file}")
+                except Exception as ex:
+                    print(f"[Warn] Could not mirror to {candidate}: {ex}")
 
     s = results.get("summary", {})
     b_side = results.get("breakdown_side", {})

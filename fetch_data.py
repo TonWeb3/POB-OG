@@ -691,7 +691,7 @@ def fetch_and_build_panel(config: Dict[str, Any], start_date: str, end_date: str
     catalog = discover_market_tokens(slugs, api_key=api_key, base_url=base_url)
     print(f"[Data] Found {len(catalog)} / {len(slugs)} markets on Polymarket.")
 
-    limiter = RateLimiter(rate_per_sec=2.5, burst=3.0)
+    limiter = RateLimiter(rate_per_sec=5.0, burst=8.0)
     quote_tasks = []
     for slug, mdata in catalog.items():
         ts = int(slug.rsplit("-", 1)[1])
@@ -705,12 +705,22 @@ def fetch_and_build_panel(config: Dict[str, Any], start_date: str, end_date: str
 
     to_download = [t for t in quote_tasks if not t[3].exists()]
     if to_download:
-        print(f"[Data] Downloading {len(to_download)} orderbook quote files (UP & DOWN) from Telonex...")
-        for i, (slug, aid, wd, qpath, outcome_label) in enumerate(to_download):
+        print(f"[Data] Downloading {len(to_download)} orderbook quote files (UP & DOWN) concurrently from Telonex...")
+        done_cnt = 0
+        dl_lock = threading.Lock()
+
+        def _download_worker(item):
+            nonlocal done_cnt
+            slug, aid, wd, qpath, outcome_label = item
             limiter.acquire()
             client.download("polymarket", "quotes", wd, qpath, asset_id=aid)
-            if (i + 1) % 20 == 0 or (i + 1) == len(to_download):
-                print(f"[Data] Downloaded quotes: {i + 1}/{len(to_download)}")
+            with dl_lock:
+                done_cnt += 1
+                if done_cnt % 50 == 0 or done_cnt == len(to_download):
+                    print(f"[Data] Downloaded quotes: {done_cnt}/{len(to_download)}")
+
+        with ThreadPoolExecutor(max_workers=6) as ex:
+            list(ex.map(_download_worker, to_download))
 
     # 3. Initialize Binance Vision Feed (spot or futures ticks, 1m/5m klines, RSI, HA, fair prob)
     feed_label = "Binance USDT-M Futures" if is_futures else "Binance Spot"
